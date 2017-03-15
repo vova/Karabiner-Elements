@@ -15,6 +15,7 @@
 #include <iostream>
 #include <mach/mach_time.h>
 
+namespace {
 class logger final {
 public:
   static spdlog::logger& get_logger(void) {
@@ -36,7 +37,7 @@ public:
       return;
     }
 
-    auto device_matching_dictionaries = iokit_utility::create_device_matching_dictionaries({
+    auto device_matching_dictionaries = krbn::iokit_utility::create_device_matching_dictionaries({
         std::make_pair(kHIDPage_GenericDesktop, kHIDUsage_GD_Keyboard),
     });
     if (device_matching_dictionaries) {
@@ -69,33 +70,15 @@ private:
       return;
     }
 
-    hids_[device] = std::make_unique<human_interface_device>(logger::get_logger(), device);
+    krbn::iokit_utility::log_matching_device(logger::get_logger(), device);
+
+    hids_[device] = std::make_unique<krbn::human_interface_device>(logger::get_logger(), device);
     auto& dev = hids_[device];
 
-    auto manufacturer = dev->get_manufacturer();
-    auto product = dev->get_product();
-    auto vendor_id = dev->get_vendor_id();
-    auto product_id = dev->get_product_id();
-    auto location_id = dev->get_location_id();
-    auto serial_number = dev->get_serial_number();
-
-    logger::get_logger().info("matching device: "
-                              "manufacturer:{1}, "
-                              "product:{2}, "
-                              "vendor_id:{3:#x}, "
-                              "product_id:{4:#x}, "
-                              "location_id:{5:#x}, "
-                              "serial_number:{6} "
-                              "@ {0}",
-                              __PRETTY_FUNCTION__,
-                              manufacturer ? *manufacturer : "",
-                              product ? *product : "",
-                              vendor_id ? *vendor_id : 0,
-                              product_id ? *product_id : 0,
-                              location_id ? *location_id : 0,
-                              serial_number ? *serial_number : "");
-
-    dev->open();
+    auto kr = dev->open();
+    if (kr != kIOReturnSuccess) {
+      logger::get_logger().error("failed to dev->open(). {0}", kr);
+    }
     dev->schedule();
 
     if (auto caps_lock_led_state = dev->get_caps_lock_led_state()) {
@@ -113,6 +96,8 @@ private:
       } else {
         dev->set_caps_lock_led_state(krbn::led_state::on);
       }
+
+      logger::get_logger().info("set_caps_lock_led_state is called.");
 
     } else {
       logger::get_logger().info("failed to get caps_lock_led_state.");
@@ -137,33 +122,25 @@ private:
       return;
     }
 
+    krbn::iokit_utility::log_removal_device(logger::get_logger(), device);
+
     auto it = hids_.find(device);
     if (it != hids_.end()) {
       auto& dev = it->second;
       if (dev) {
-        auto vendor_id = dev->get_vendor_id();
-        auto product_id = dev->get_product_id();
-        auto location_id = dev->get_location_id();
-        logger::get_logger().info("removal device: "
-                                  "vendor_id:{1:#x}, "
-                                  "product_id:{2:#x}, "
-                                  "location_id:{3:#x} "
-                                  "@ {0}",
-                                  __PRETTY_FUNCTION__,
-                                  vendor_id ? *vendor_id : 0,
-                                  product_id ? *product_id : 0,
-                                  location_id ? *location_id : 0);
-
         hids_.erase(it);
       }
     }
   }
 
   IOHIDManagerRef _Nullable manager_;
-  std::unordered_map<IOHIDDeviceRef, std::unique_ptr<human_interface_device>> hids_;
+  std::unordered_map<IOHIDDeviceRef, std::unique_ptr<krbn::human_interface_device>> hids_;
 };
+}
 
 int main(int argc, const char* argv[]) {
+  krbn::thread_utility::register_main_thread();
+
   if (getuid() != 0) {
     logger::get_logger().error("control_led requires root privilege.");
   }

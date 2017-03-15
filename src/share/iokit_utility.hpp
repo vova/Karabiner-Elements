@@ -2,14 +2,18 @@
 
 #include "boost_defs.hpp"
 
+#include "cf_utility.hpp"
+#include "types.hpp"
 #include <IOKit/IOKitLib.h>
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/hid/IOHIDKeys.h>
 #include <boost/optional.hpp>
 #include <cstdint>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <vector>
 
+namespace krbn {
 class iokit_utility final {
 public:
   static boost::optional<uint64_t> get_registry_entry_id(io_registry_entry_t registry_entry) {
@@ -35,11 +39,7 @@ public:
                                                         key,
                                                         kCFAllocatorDefault,
                                                         kIORegistryIterateRecursively | kIORegistryIterateParents)) {
-      std::string value;
-      if (auto p = CFStringGetCStringPtr(static_cast<CFStringRef>(property), kCFStringEncodingUTF8)) {
-        value = p;
-      }
-
+      auto value = cf_utility::to_string(property);
       CFRelease(property);
       return value;
     }
@@ -137,36 +137,32 @@ public:
 
   static boost::optional<std::string> get_string_property(IOHIDDeviceRef _Nonnull device, CFStringRef _Nonnull key) {
     auto property = IOHIDDeviceGetProperty(device, key);
-    if (!property) {
-      return boost::none;
-    }
-
-    if (CFStringGetTypeID() != CFGetTypeID(property)) {
-      return boost::none;
-    }
-
-    std::string value;
-    if (auto p = CFStringGetCStringPtr(static_cast<CFStringRef>(property), kCFStringEncodingUTF8)) {
-      value = p;
-    }
-
-    return value;
+    return cf_utility::to_string(property);
   }
 
   static boost::optional<long> get_max_input_report_size(IOHIDDeviceRef _Nonnull device) {
     return get_long_property(device, CFSTR(kIOHIDMaxInputReportSizeKey));
   }
 
-  static boost::optional<long> get_vendor_id(IOHIDDeviceRef _Nonnull device) {
-    return get_long_property(device, CFSTR(kIOHIDVendorIDKey));
+  static boost::optional<vendor_id> get_vendor_id(IOHIDDeviceRef _Nonnull device) {
+    if (auto value = get_long_property(device, CFSTR(kIOHIDVendorIDKey))) {
+      return static_cast<vendor_id>(*value);
+    }
+    return boost::none;
   }
 
-  static boost::optional<long> get_product_id(IOHIDDeviceRef _Nonnull device) {
-    return get_long_property(device, CFSTR(kIOHIDProductIDKey));
+  static boost::optional<product_id> get_product_id(IOHIDDeviceRef _Nonnull device) {
+    if (auto value = get_long_property(device, CFSTR(kIOHIDProductIDKey))) {
+      return static_cast<product_id>(*value);
+    }
+    return boost::none;
   }
 
-  static boost::optional<long> get_location_id(IOHIDDeviceRef _Nonnull device) {
-    return get_long_property(device, CFSTR(kIOHIDLocationIDKey));
+  static boost::optional<location_id> get_location_id(IOHIDDeviceRef _Nonnull device) {
+    if (auto value = get_long_property(device, CFSTR(kIOHIDLocationIDKey))) {
+      return static_cast<location_id>(*value);
+    }
+    return boost::none;
   }
 
   static boost::optional<std::string> get_manufacturer(IOHIDDeviceRef _Nonnull device) {
@@ -184,4 +180,45 @@ public:
   static boost::optional<std::string> get_transport(IOHIDDeviceRef _Nonnull device) {
     return get_string_property(device, CFSTR(kIOHIDTransportKey));
   }
+
+  static void log_matching_device(spdlog::logger& logger,
+                                  IOHIDDeviceRef _Nonnull device) {
+    logger.info("matching device:");
+    if (auto manufacturer = get_manufacturer(device)) {
+      logger.info("  manufacturer: {0}", *manufacturer);
+    }
+    if (auto product = get_product(device)) {
+      logger.info("  product: {0}", *product);
+    }
+    if (auto vendor_id = get_vendor_id(device)) {
+      logger.info("  vendor_id: {0:#x}", static_cast<uint32_t>(*vendor_id));
+    }
+    if (auto product_id = get_product_id(device)) {
+      logger.info("  product_id: {0:#x}", static_cast<uint32_t>(*product_id));
+    }
+    if (auto location_id = get_location_id(device)) {
+      logger.info("  location_id: {0:#x}", static_cast<uint32_t>(*location_id));
+    }
+    if (auto serial_number = get_serial_number(device)) {
+      logger.info("  serial_number: {0}", *serial_number);
+    }
+    if (auto registry_entry_id = get_registry_entry_id(device)) {
+      logger.info("  registry_entry_id: {0}", *registry_entry_id);
+    }
+  }
+
+  static void log_removal_device(spdlog::logger& logger,
+                                 IOHIDDeviceRef _Nonnull device) {
+    logger.info("removal device:");
+    if (auto vendor_id = get_vendor_id(device)) {
+      logger.info("  vendor_id: {0:#x}", static_cast<uint32_t>(*vendor_id));
+    }
+    if (auto product_id = get_product_id(device)) {
+      logger.info("  product_id: {0:#x}", static_cast<uint32_t>(*product_id));
+    }
+    if (auto location_id = get_location_id(device)) {
+      logger.info("  location_id: {0:#x}", static_cast<uint32_t>(*location_id));
+    }
+  }
 };
+}

@@ -2,10 +2,14 @@
 
 #include "boost_defs.hpp"
 
+BEGIN_BOOST_INCLUDE
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
+END_BOOST_INCLUDE
+
 #include <thread>
 
+namespace krbn {
 class local_datagram_client final {
 public:
   local_datagram_client(const local_datagram_client&) = delete;
@@ -70,3 +74,4 @@ private:
   boost::asio::local::datagram_protocol::socket socket_;
   std::thread thread_;
 };
+}

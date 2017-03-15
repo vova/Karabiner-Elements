@@ -8,10 +8,7 @@ PATH="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:$GEM_HOME/bin"; export PATH
 version=$(cat version)
 
 echo "make build"
-make build | ruby scripts/reduce-logs.rb
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    exit 99
-fi
+ruby scripts/reduce-logs.rb 'make build' || exit 99
 
 # --------------------------------------------------
 echo "Copy Files"
@@ -19,23 +16,25 @@ echo "Copy Files"
 rm -rf pkgroot
 mkdir -p pkgroot
 
-basedir="pkgroot/Library/Extensions"
-mkdir -p "$basedir"
-for kext in VirtualHIDKeyboard.kext VirtualHIDManager.kext VirtualHIDPointing.kext; do
-    cp -R "src/core/kext/VirtualHIDDevice/build/Release/$kext" "$basedir/org.pqrs.driver.$kext"
-done
-
 basedir="pkgroot/Library/Application Support/org.pqrs/Karabiner-Elements"
 mkdir -p "$basedir"
-cp src/scripts/uninstaller.applescript "$basedir"
+cp version "$basedir"
 cp src/scripts/uninstall.sh "$basedir"
-cp pkginfo/Scripts/preinstall "$basedir/uninstall_core.sh"
+cp src/scripts/uninstall_core.sh "$basedir"
+cp -R "src/vendor/Karabiner-VirtualHIDDevice/dist" "$basedir/Karabiner-VirtualHIDDevice"
+cp -R "src/apps/Menu/build/Release/Karabiner-Menu.app" "$basedir"
+
+basedir="pkgroot/Library/Application Support/org.pqrs/Karabiner-Elements/scripts"
+mkdir -p "$basedir"
+cp src/scripts/copy_current_profile_to_system_default_profile.applescript "$basedir"
+cp src/scripts/remove_system_default_profile.applescript "$basedir"
+cp src/scripts/uninstaller.applescript "$basedir"
 
 basedir="pkgroot/Library/Application Support/org.pqrs/Karabiner-Elements/bin"
 mkdir -p "$basedir"
-cp src/core/grabber/build/Release/karabiner_grabber "$basedir"
-cp src/core/event_dispatcher/build/Release/karabiner_event_dispatcher "$basedir"
+cp src/bin/cli/build/Release/karabiner_cli "$basedir"
 cp src/core/console_user_server/build/Release/karabiner_console_user_server "$basedir"
+cp src/core/grabber/build/Release/karabiner_grabber "$basedir"
 
 basedir="pkgroot/Library/Application Support/org.pqrs/Karabiner-Elements/updater"
 mkdir -p "$basedir"

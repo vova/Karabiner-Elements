@@ -2,67 +2,73 @@
 
 #include "boost_defs.hpp"
 
-#include "event_dispatcher_manager.hpp"
+#include "gcd_utility.hpp"
 #include "logger.hpp"
 #include "manipulator.hpp"
 #include "modifier_flag_manager.hpp"
+#include "pointing_button_manager.hpp"
 #include "system_preferences.hpp"
 #include "types.hpp"
-#include "virtual_hid_manager_client.hpp"
+#include "virtual_hid_device_client.hpp"
 #include <IOKit/hidsystem/ev_keymap.h>
 #include <boost/optional.hpp>
 #include <list>
 #include <thread>
 #include <unordered_map>
 
+namespace krbn {
 namespace manipulator {
 class event_manipulator final {
 public:
   event_manipulator(const event_manipulator&) = delete;
 
-  event_manipulator(void) : event_dispatcher_manager_(),
-                            virtual_hid_manager_client_(logger::get_logger()),
-                            event_source_(CGEventSourceCreate(kCGEventSourceStateHIDSystemState)),
-                            modifier_flag_manager_(),
-                            key_repeat_manager_(*this) {
+  event_manipulator(virtual_hid_device_client& virtual_hid_device_client) : virtual_hid_device_client_(virtual_hid_device_client),
+                                                                            last_timestamp_(0) {
   }
 
   ~event_manipulator(void) {
-    if (event_source_) {
-      CFRelease(event_source_);
-      event_source_ = nullptr;
-    }
   }
 
-  bool is_ready(void) {
-    return virtual_hid_manager_client_.is_connected() &&
-           event_dispatcher_manager_.is_connected() &&
-           event_source_ != nullptr;
+  enum class ready_state {
+    ready,
+    virtual_hid_device_client_is_not_ready,
+    virtual_hid_keyboard_is_not_ready,
+  };
+
+  ready_state is_ready(void) {
+    if (!virtual_hid_device_client_.is_connected()) {
+      return ready_state::virtual_hid_device_client_is_not_ready;
+    }
+    if (!virtual_hid_device_client_.is_virtual_hid_keyboard_initialized()) {
+      return ready_state::virtual_hid_keyboard_is_not_ready;
+    }
+    return ready_state::ready;
   }
 
   void reset(void) {
-    key_repeat_manager_.stop();
-
     manipulated_keys_.clear();
     manipulated_fn_keys_.clear();
 
     modifier_flag_manager_.reset();
     modifier_flag_manager_.unlock();
-    hid_report::keyboard_input report;
-    virtual_hid_manager_client_.post_keyboard_input_report(report);
 
-    event_dispatcher_manager_.set_caps_lock_state(false);
+    pointing_button_manager_.reset();
+
+    // Do not call terminate_virtual_hid_keyboard
+    virtual_hid_device_client_.terminate_virtual_hid_pointing();
   }
 
   void reset_modifier_flag_state(void) {
     modifier_flag_manager_.reset();
     // Do not call modifier_flag_manager_.unlock() here.
-    hid_report::keyboard_input report;
-    virtual_hid_manager_client_.post_keyboard_input_report(report);
   }
 
-  void relaunch_event_dispatcher(void) {
-    event_dispatcher_manager_.relaunch();
+  void reset_pointing_button_state(void) {
+    auto bits = pointing_button_manager_.get_hid_report_bits();
+    pointing_button_manager_.reset();
+    if (bits) {
+      virtual_hid_device_client_.reset_virtual_hid_pointing();
+    }
   }
 
   void set_system_preferences_values(const system_preferences::values& values) {
@@ -71,28 +77,41 @@ public:
     system_preferences_values_ = values;
   }
 
-  void clear_simple_modifications(void) {
-    simple_modifications_.clear();
+  void set_profile(const core_configuration::profile& profile) {
+    simple_modifications_key_code_map_ = profile.get_simple_modifications_key_code_map(logger::get_logger());
+    fn_function_keys_key_code_map_ = profile.get_fn_function_keys_key_code_map(logger::get_logger());
+
+    pqrs::karabiner_virtual_hid_device::properties::keyboard_initialization properties;
+    if (auto k = types::get_keyboard_type(profile.get_virtual_hid_keyboard().get_keyboard_type())) {
+      properties.keyboard_type = *k;
+    }
+    properties.caps_lock_delay_milliseconds = pqrs::karabiner_virtual_hid_device::milliseconds(profile.get_virtual_hid_keyboard().get_caps_lock_delay_milliseconds());
+    virtual_hid_device_client_.initialize_virtual_hid_keyboard(properties);
   }
 
-  void add_simple_modification(krbn::key_code from_key_code, krbn::key_code to_key_code) {
-    simple_modifications_.add(from_key_code, to_key_code);
+  void unset_profile(void) {
+    simple_modifications_key_code_map_ = std::unordered_map<key_code, key_code>();
+    fn_function_keys_key_code_map_ = std::unordered_map<key_code, key_code>();
   }
 
-  void clear_fn_function_keys(void) {
-    fn_function_keys_.clear();
+  void initialize_virtual_hid_pointing(void) {
+    virtual_hid_device_client_.initialize_virtual_hid_pointing();
   }
 
-  void add_fn_function_key(krbn::key_code from_key_code, krbn::key_code to_key_code) {
-    fn_function_keys_.add(from_key_code, to_key_code);
+  void terminate_virtual_hid_pointing(void) {
+    virtual_hid_device_client_.terminate_virtual_hid_pointing();
   }
 
-  void create_event_dispatcher_client(void) {
-    event_dispatcher_manager_.create_event_dispatcher_client();
+  void set_caps_lock_state(bool state) {
+    modifier_flag_manager_.manipulate(modifier_flag::caps_lock,
+                                      state ? modifier_flag_manager::operation::lock : modifier_flag_manager::operation::unlock);
   }
 
-  void handle_keyboard_event(device_registry_entry_id device_registry_entry_id, krbn::key_code from_key_code, bool pressed) {
-    krbn::key_code to_key_code = from_key_code;
+  void handle_keyboard_event(device_registry_entry_id device_registry_entry_id,
+                             uint64_t timestamp,
+                             key_code from_key_code,
+                             bool pressed) {
+    key_code to_key_code = from_key_code;
 
     // ----------------------------------------
     // modify keys
@@ -102,9 +121,10 @@ public:
         to_key_code = *key_code;
       }
     } else {
-      if (auto key_code = simple_modifications_.get(from_key_code)) {
-        manipulated_keys_.add(device_registry_entry_id, from_key_code, *key_code);
-        to_key_code = *key_code;
+      auto it = simple_modifications_key_code_map_.find(from_key_code);
+      if (it != simple_modifications_key_code_map_.end()) {
+        to_key_code = it->second;
+        manipulated_keys_.add(device_registry_entry_id, from_key_code, to_key_code);
       }
     }
 
@@ -116,27 +136,27 @@ public:
         to_key_code = *key_code;
       }
     } else {
-      boost::optional<krbn::key_code> key_code;
+      boost::optional<key_code> key_code;
 
-      if (modifier_flag_manager_.pressed(krbn::modifier_flag::fn)) {
+      if (modifier_flag_manager_.pressed(modifier_flag::fn)) {
         switch (to_key_code) {
-        case krbn::key_code::return_or_enter:
-          key_code = krbn::key_code::keypad_enter;
+        case key_code::return_or_enter:
+          key_code = key_code::keypad_enter;
           break;
-        case krbn::key_code::delete_or_backspace:
-          key_code = krbn::key_code::delete_forward;
+        case key_code::delete_or_backspace:
+          key_code = key_code::delete_forward;
           break;
-        case krbn::key_code::right_arrow:
-          key_code = krbn::key_code::end;
+        case key_code::right_arrow:
+          key_code = key_code::end;
           break;
-        case krbn::key_code::left_arrow:
-          key_code = krbn::key_code::home;
+        case key_code::left_arrow:
+          key_code = key_code::home;
           break;
-        case krbn::key_code::down_arrow:
-          key_code = krbn::key_code::page_down;
+        case key_code::down_arrow:
+          key_code = key_code::page_down;
           break;
-        case krbn::key_code::up_arrow:
-          key_code = krbn::key_code::page_up;
+        case key_code::up_arrow:
+          key_code = key_code::page_up;
           break;
         default:
           break;
@@ -153,13 +173,14 @@ public:
             keyboard_fn_state = system_preferences_values_.get_keyboard_fn_state();
           }
 
-          bool fn_pressed = modifier_flag_manager_.pressed(krbn::modifier_flag::fn);
+          bool fn_pressed = modifier_flag_manager_.pressed(modifier_flag::fn);
 
           if ((fn_pressed && keyboard_fn_state) ||
               (!fn_pressed && !keyboard_fn_state)) {
             // change f1-f12 keys to media controls
-            if (auto k = fn_function_keys_.get(to_key_code)) {
-              key_code = *k;
+            auto it = fn_function_keys_key_code_map_.find(to_key_code);
+            if (it != fn_function_keys_key_code_map_.end()) {
+              key_code = it->second;
             }
           }
         }
@@ -172,47 +193,68 @@ public:
     }
 
     // ----------------------------------------
-    // Post input events to karabiner_event_dispatcher
+    if (post_modifier_flag_event(to_key_code, pressed, timestamp)) {
+      return;
+    }
 
-    if (to_key_code == krbn::key_code::caps_lock) {
-      if (pressed) {
-        toggle_caps_lock_state();
-        key_repeat_manager_.stop();
+    post_key(to_key_code, pressed, timestamp);
+  }
+
+  void handle_pointing_event(device_registry_entry_id device_registry_entry_id,
+                             uint64_t timestamp,
+                             pointing_event pointing_event,
+                             boost::optional<pointing_button> pointing_button,
+                             CFIndex integer_value) {
+    pqrs::karabiner_virtual_hid_device::hid_report::pointing_input report;
+
+    switch (pointing_event) {
+    case pointing_event::button:
+      if (pointing_button && *pointing_button != pointing_button::zero) {
+        pointing_button_manager_.manipulate(*pointing_button,
+                                            integer_value ? pointing_button_manager::operation::increase : pointing_button_manager::operation::decrease);
       }
-      return;
+      break;
+
+    case pointing_event::x:
+      report.x = integer_value;
+      break;
+
+    case pointing_event::y:
+      report.y = integer_value;
+      break;
+
+    case pointing_event::vertical_wheel:
+      report.vertical_wheel = integer_value;
+      break;
+
+    case pointing_event::horizontal_wheel:
+      report.horizontal_wheel = integer_value;
+      break;
+
+    default:
+      break;
     }
 
-    if (post_modifier_flag_event(to_key_code, pressed)) {
-      key_repeat_manager_.stop();
-      return;
-    }
-
-    post_key(from_key_code, to_key_code, pressed);
-
-    // set key repeat
-    long initial_key_repeat_milliseconds = 0;
-    long key_repeat_milliseconds = 0;
-    {
-      std::lock_guard<std::mutex> guard(system_preferences_values_mutex_);
-      initial_key_repeat_milliseconds = system_preferences_values_.get_initial_key_repeat_milliseconds();
-      key_repeat_milliseconds = system_preferences_values_.get_key_repeat_milliseconds();
-    }
-
-    key_repeat_manager_.start(from_key_code, to_key_code, pressed,
-                              initial_key_repeat_milliseconds, key_repeat_milliseconds);
+    auto bits = pointing_button_manager_.get_hid_report_bits();
+    report.buttons[0] = (bits >> 0) & 0xff;
+    report.buttons[1] = (bits >> 8) & 0xff;
+    report.buttons[2] = (bits >> 16) & 0xff;
+    report.buttons[3] = (bits >> 24) & 0xff;
+    virtual_hid_device_client_.post_pointing_input_report(report);
   }
 
   void stop_key_repeat(void) {
-    key_repeat_manager_.stop();
-  }
-
-  void refresh_caps_lock_led(void) {
-    event_dispatcher_manager_.refresh_caps_lock_led();
+    virtual_hid_device_client_.reset_virtual_hid_keyboard();
   }
 
 private:
   class manipulated_keys final {
   public:
+    manipulated_keys(const manipulated_keys&) = delete;
+
+    manipulated_keys(void) {
+    }
+
     void clear(void) {
       std::lock_guard<std::mutex> guard(mutex_);
 
@@ -220,15 +262,15 @@ private:
     }
 
     void add(device_registry_entry_id device_registry_entry_id,
-             krbn::key_code from_key_code,
-             krbn::key_code to_key_code) {
+             key_code from_key_code,
+             key_code to_key_code) {
       std::lock_guard<std::mutex> guard(mutex_);
 
       manipulated_keys_.push_back(manipulated_key(device_registry_entry_id, from_key_code, to_key_code));
     }
 
-    boost::optional<krbn::key_code> find(device_registry_entry_id device_registry_entry_id,
-                                         krbn::key_code from_key_code) {
+    boost::optional<key_code> find(device_registry_entry_id device_registry_entry_id,
+                                   key_code from_key_code) {
       std::lock_guard<std::mutex> guard(mutex_);
 
       for (const auto& v : manipulated_keys_) {
@@ -241,7 +283,7 @@ private:
     }
 
     void remove(device_registry_entry_id device_registry_entry_id,
-                krbn::key_code from_key_code) {
+                key_code from_key_code) {
       std::lock_guard<std::mutex> guard(mutex_);
 
       manipulated_keys_.remove_if([&](const manipulated_key& v) {
@@ -254,197 +296,96 @@ private:
     class manipulated_key final {
     public:
       manipulated_key(device_registry_entry_id device_registry_entry_id,
-                      krbn::key_code from_key_code,
-                      krbn::key_code to_key_code) : device_registry_entry_id_(device_registry_entry_id),
-                                                    from_key_code_(from_key_code),
-                                                    to_key_code_(to_key_code) {
+                      key_code from_key_code,
+                      key_code to_key_code) : device_registry_entry_id_(device_registry_entry_id),
+                                              from_key_code_(from_key_code),
+                                              to_key_code_(to_key_code) {
       }
 
       device_registry_entry_id get_device_registry_entry_id(void) const { return device_registry_entry_id_; }
-      krbn::key_code get_from_key_code(void) const { return from_key_code_; }
-      krbn::key_code get_to_key_code(void) const { return to_key_code_; }
+      key_code get_from_key_code(void) const { return from_key_code_; }
+      key_code get_to_key_code(void) const { return to_key_code_; }
 
     private:
       device_registry_entry_id device_registry_entry_id_;
-      krbn::key_code from_key_code_;
-      krbn::key_code to_key_code_;
+      key_code from_key_code_;
+      key_code to_key_code_;
     };
 
     std::list<manipulated_key> manipulated_keys_;
     std::mutex mutex_;
   };
 
-  class simple_modifications final {
-  public:
-    void clear(void) {
-      std::lock_guard<std::mutex> guard(mutex_);
-
-      map_.clear();
-    }
-
-    void add(krbn::key_code from_key_code, krbn::key_code to_key_code) {
-      std::lock_guard<std::mutex> guard(mutex_);
-
-      map_[from_key_code] = to_key_code;
-    }
-
-    boost::optional<krbn::key_code> get(krbn::key_code from_key_code) {
-      std::lock_guard<std::mutex> guard(mutex_);
-
-      auto it = map_.find(from_key_code);
-      if (it != map_.end()) {
-        return it->second;
-      }
-
-      return boost::none;
-    }
-
-  private:
-    std::unordered_map<krbn::key_code, krbn::key_code> map_;
-    std::mutex mutex_;
-  };
-
-  class key_repeat_manager final {
-  public:
-    key_repeat_manager(event_manipulator& event_manipulator) : event_manipulator_(event_manipulator),
-                                                               queue_(dispatch_queue_create(nullptr, nullptr)),
-                                                               timer_(0) {
-    }
-
-    ~key_repeat_manager(void) {
-      stop();
-
-      dispatch_release(queue_);
-    }
-
-    void stop(void) {
-      std::lock_guard<std::mutex> guard(mutex_);
-
-      if (timer_) {
-        dispatch_source_cancel(timer_);
-        dispatch_release(timer_);
-        timer_ = 0;
-      }
-    }
-
-    void start(krbn::key_code from_key_code, krbn::key_code to_key_code, bool pressed,
-               long initial_key_repeat_milliseconds, long key_repeat_milliseconds) {
-      // stop key repeat before post key.
-      if (pressed) {
-        stop();
-      } else {
-        if (from_key_code_ && *from_key_code_ == from_key_code) {
-          stop();
-        }
-      }
-
-      // set key repeat
-      if (pressed) {
-        if (to_key_code == krbn::key_code::mute ||
-            to_key_code == krbn::key_code::vk_consumer_play) {
-          return;
-        }
-
-        timer_ = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, queue_);
-        if (timer_) {
-          std::lock_guard<std::mutex> guard(mutex_);
-
-          dispatch_source_set_timer(timer_,
-                                    dispatch_time(DISPATCH_TIME_NOW, initial_key_repeat_milliseconds * NSEC_PER_MSEC),
-                                    key_repeat_milliseconds * NSEC_PER_MSEC,
-                                    0);
-          dispatch_source_set_event_handler(timer_, ^{
-            event_manipulator_.post_key(from_key_code, to_key_code, pressed);
-          });
-          dispatch_resume(timer_);
-          from_key_code_ = from_key_code;
-        }
-      }
-    }
-
-  private:
-    event_manipulator& event_manipulator_;
-
-    dispatch_queue_t queue_;
-    dispatch_source_t timer_;
-
-    boost::optional<krbn::key_code> from_key_code_;
-    std::mutex mutex_;
-  };
-
-  bool post_modifier_flag_event(krbn::key_code key_code, bool pressed) {
+  bool post_modifier_flag_event(key_code key_code, bool pressed, uint64_t timestamp) {
     auto operation = pressed ? manipulator::modifier_flag_manager::operation::increase : manipulator::modifier_flag_manager::operation::decrease;
 
-    auto modifier_flag = krbn::types::get_modifier_flag(key_code);
-    if (modifier_flag != krbn::modifier_flag::zero) {
+    auto modifier_flag = types::get_modifier_flag(key_code);
+    if (modifier_flag != modifier_flag::zero) {
       modifier_flag_manager_.manipulate(modifier_flag, operation);
 
-      // We have to post modifier key event via CGEventPost for some apps (Microsoft Remote Desktop)
-      if (event_source_) {
-        if (auto cg_key = krbn::types::get_cg_key(key_code)) {
-          if (auto event = CGEventCreateKeyboardEvent(event_source_, static_cast<CGKeyCode>(*cg_key), pressed)) {
-            CGEventSetFlags(event, modifier_flag_manager_.get_cg_event_flags(key_code, CGEventGetFlags(event)));
-            CGEventPost(kCGHIDEventTap, event);
-            CFRelease(event);
-          }
-        }
-      }
-
-      // We have to post modifier key event via virtual device driver for mouse events.
-      //
-      // Note:
-      // Unproperly usage of virtual device driver causes a security issue.
-      // Please read DEVELOPER.md > IOKit device report in kext.
-      //
-      hid_report::keyboard_input report;
-      report.modifiers = modifier_flag_manager_.get_hid_report_bits();
-      virtual_hid_manager_client_.post_keyboard_input_report(report);
-
+      post_key(key_code, pressed, timestamp);
       return true;
     }
 
     return false;
   }
 
-  void toggle_caps_lock_state(void) {
-    modifier_flag_manager_.manipulate(krbn::modifier_flag::caps_lock, modifier_flag_manager::operation::toggle_lock);
-    if (modifier_flag_manager_.pressed(krbn::modifier_flag::caps_lock)) {
-      event_dispatcher_manager_.set_caps_lock_state(true);
+  void post_key(key_code key_code, bool pressed, uint64_t timestamp) {
+    add_delay_to_continuous_event(timestamp);
+
+    if (auto usage_page = types::get_usage_page(key_code)) {
+      if (auto usage = types::get_usage(key_code)) {
+        pqrs::karabiner_virtual_hid_device::hid_event_service::keyboard_event keyboard_event;
+        keyboard_event.usage_page = *usage_page;
+        keyboard_event.usage = *usage;
+        keyboard_event.value = pressed;
+        virtual_hid_device_client_.dispatch_keyboard_event(keyboard_event);
+      }
+    }
+  }
+
+  void add_delay_to_continuous_event(uint64_t timestamp) {
+    if (timestamp != last_timestamp_) {
+      last_timestamp_ = timestamp;
+
     } else {
-      event_dispatcher_manager_.set_caps_lock_state(false);
+      // We need to add a delay to continous events to ensure the key events order in WindowServer.
+      //
+      // Unless the delay, application will receive FlagsChanged event after KeyDown events even if the modifier key is sent before.
+      //
+      // Example of no delay:
+      //   In event_manipulator:
+      //     1. send shift key down
+      //     2. send tab key down
+      //     3. send tab key up
+      //     4. send shift key up
+      //
+      //   In application
+      //     1. KeyDown tab
+      //     2. FlagsChanged shift
+      //     3. KeyUp tab
+      //     4. FlagsChanged shift
+      //
+      // We need the delay to avoid this order changes.
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
 
-  void post_key(krbn::key_code from_key_code, krbn::key_code to_key_code, bool pressed) {
-    if (event_source_) {
-      if (auto cg_key = krbn::types::get_cg_key(to_key_code)) {
-        if (auto event = CGEventCreateKeyboardEvent(event_source_, static_cast<CGKeyCode>(*cg_key), pressed)) {
-          CGEventSetFlags(event, modifier_flag_manager_.get_cg_event_flags(to_key_code, CGEventGetFlags(event)));
-          CGEventPost(kCGHIDEventTap, event);
-          CFRelease(event);
-        }
-      }
-      if (auto hid_aux_control_button = krbn::types::get_hid_aux_control_button(to_key_code)) {
-        auto event_type = pressed ? krbn::event_type::key_down : krbn::event_type::key_up;
-        auto flags = modifier_flag_manager_.get_io_option_bits();
-        event_dispatcher_manager_.post_key(to_key_code, event_type, flags, false);
-      }
-    }
-  }
-
-  event_dispatcher_manager event_dispatcher_manager_;
-  virtual_hid_manager_client virtual_hid_manager_client_;
+  virtual_hid_device_client& virtual_hid_device_client_;
   modifier_flag_manager modifier_flag_manager_;
-  CGEventSourceRef event_source_;
-  key_repeat_manager key_repeat_manager_;
+  pointing_button_manager pointing_button_manager_;
 
   system_preferences::values system_preferences_values_;
   std::mutex system_preferences_values_mutex_;
 
-  simple_modifications simple_modifications_;
-  simple_modifications fn_function_keys_;
+  std::unordered_map<key_code, key_code> simple_modifications_key_code_map_;
+  std::unordered_map<key_code, key_code> fn_function_keys_key_code_map_;
 
   manipulated_keys manipulated_keys_;
   manipulated_keys manipulated_fn_keys_;
+
+  uint64_t last_timestamp_;
 };
+}
 }

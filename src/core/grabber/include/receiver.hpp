@@ -9,6 +9,7 @@
 #include "types.hpp"
 #include <vector>
 
+namespace krbn {
 class receiver final {
 public:
   receiver(const receiver&) = delete;
@@ -17,7 +18,7 @@ public:
            device_grabber& device_grabber) : event_manipulator_(event_manipulator),
                                              device_grabber_(device_grabber),
                                              exit_loop_(false) {
-    const size_t buffer_length = 1024 * 1024;
+    const size_t buffer_length = 32 * 1024;
     buffer_.resize(buffer_length);
 
     const char* path = constants::get_grabber_socket_file_path();
@@ -28,6 +29,8 @@ public:
       chown(path, *uid, 0);
     }
     chmod(path, 0600);
+
+    start_grabbing_if_system_core_configuration_file_exists();
 
     exit_loop_ = false;
     thread_ = std::thread([this] { this->worker(); });
@@ -43,9 +46,8 @@ public:
 
     server_ = nullptr;
     console_user_server_process_monitor_ = nullptr;
-    device_grabber_.ungrab_devices();
-    event_manipulator_.clear_simple_modifications();
-    event_manipulator_.clear_fn_function_keys();
+    device_grabber_.stop_grabbing();
+    event_manipulator_.unset_profile();
   }
 
 private:
@@ -59,79 +61,35 @@ private:
       std::size_t n = server_->receive(boost::asio::buffer(buffer_), boost::posix_time::seconds(1), ec);
 
       if (!ec && n > 0) {
-        switch (krbn::operation_type(buffer_[0])) {
-        case krbn::operation_type::connect:
-          if (n != sizeof(krbn::operation_type_connect_struct)) {
-            logger::get_logger().error("invalid size for krbn::operation_type::connect");
+        switch (operation_type(buffer_[0])) {
+        case operation_type::connect:
+          if (n != sizeof(operation_type_connect_struct)) {
+            logger::get_logger().error("invalid size for operation_type::connect");
           } else {
-            auto p = reinterpret_cast<krbn::operation_type_connect_struct*>(&(buffer_[0]));
+            auto p = reinterpret_cast<operation_type_connect_struct*>(&(buffer_[0]));
 
-            switch (p->connect_from) {
-            case krbn::connect_from::event_dispatcher:
-              logger::get_logger().info("karabiner_event_dispatcher is connected (pid:{0})", p->pid);
-              event_manipulator_.create_event_dispatcher_client();
-              break;
+            // Ensure user_core_configuration_file_path is null-terminated string even if corrupted data is sent.
+            p->user_core_configuration_file_path[sizeof(p->user_core_configuration_file_path) - 1] = '\0';
 
-            case krbn::connect_from::console_user_server:
-              logger::get_logger().info("karabiner_console_user_server is connected (pid:{0})", p->pid);
+            logger::get_logger().info("karabiner_console_user_server is connected (pid:{0})", p->pid);
 
-              device_grabber_.grab_devices();
+            device_grabber_.start_grabbing(p->user_core_configuration_file_path);
 
-              // monitor the last process
-              console_user_server_process_monitor_ = nullptr;
-              console_user_server_process_monitor_ = std::make_unique<process_monitor>(logger::get_logger(),
-                                                                                       p->pid,
-                                                                                       std::bind(&receiver::console_user_server_exit_callback, this));
-
-              break;
-            }
+            // monitor the last process
+            console_user_server_process_monitor_ = nullptr;
+            console_user_server_process_monitor_ = std::make_unique<process_monitor>(logger::get_logger(),
+                                                                                     p->pid,
+                                                                                     std::bind(&receiver::console_user_server_exit_callback, this));
           }
           break;
 
-        case krbn::operation_type::system_preferences_values_updated:
-          if (n < sizeof(krbn::operation_type_system_preferences_values_updated_struct)) {
-            logger::get_logger().error("invalid size for krbn::operation_type::system_preferences_values_updated ({0})", n);
+        case operation_type::system_preferences_values_updated:
+          if (n < sizeof(operation_type_system_preferences_values_updated_struct)) {
+            logger::get_logger().error("invalid size for operation_type::system_preferences_values_updated ({0})", n);
           } else {
-            auto p = reinterpret_cast<krbn::operation_type_system_preferences_values_updated_struct*>(&(buffer_[0]));
+            auto p = reinterpret_cast<operation_type_system_preferences_values_updated_struct*>(&(buffer_[0]));
             event_manipulator_.set_system_preferences_values(p->values);
             logger::get_logger().info("system_preferences_values_updated");
-          }
-          break;
-
-        case krbn::operation_type::set_caps_lock_led_state:
-          if (n < sizeof(krbn::operation_type_set_caps_lock_led_state_struct)) {
-            logger::get_logger().error("invalid size for krbn::operation_type::set_caps_lock_led_state ({0})", n);
-          } else {
-            auto p = reinterpret_cast<krbn::operation_type_set_caps_lock_led_state_struct*>(&(buffer_[0]));
-            // bind variables
-            auto led_state = p->led_state;
-            device_grabber_.set_caps_lock_led_state(led_state);
-          }
-          break;
-
-        case krbn::operation_type::clear_simple_modifications:
-          event_manipulator_.clear_simple_modifications();
-          break;
-
-        case krbn::operation_type::add_simple_modification:
-          if (n < sizeof(krbn::operation_type_add_simple_modification_struct)) {
-            logger::get_logger().error("invalid size for krbn::operation_type::add_simple_modification ({0})", n);
-          } else {
-            auto p = reinterpret_cast<krbn::operation_type_add_simple_modification_struct*>(&(buffer_[0]));
-            event_manipulator_.add_simple_modification(p->from_key_code, p->to_key_code);
-          }
-          break;
-
-        case krbn::operation_type::clear_fn_function_keys:
-          event_manipulator_.clear_fn_function_keys();
-          break;
-
-        case krbn::operation_type::add_fn_function_key:
-          if (n < sizeof(krbn::operation_type_add_fn_function_key_struct)) {
-            logger::get_logger().error("invalid size for krbn::operation_type::add_fn_function_key ({0})", n);
-          } else {
-            auto p = reinterpret_cast<krbn::operation_type_add_fn_function_key_struct*>(&(buffer_[0]));
-            event_manipulator_.add_fn_function_key(p->from_key_code, p->to_key_code);
           }
           break;
 
@@ -143,7 +101,16 @@ private:
   }
 
   void console_user_server_exit_callback(void) {
-    device_grabber_.ungrab_devices();
+    device_grabber_.stop_grabbing();
+
+    start_grabbing_if_system_core_configuration_file_exists();
+  }
+
+  void start_grabbing_if_system_core_configuration_file_exists(void) {
+    auto file_path = constants::get_system_core_configuration_file_path();
+    if (filesystem::exists(file_path)) {
+      device_grabber_.start_grabbing(file_path);
+    }
   }
 
   manipulator::event_manipulator& event_manipulator_;
@@ -156,3 +123,4 @@ private:
 
   std::unique_ptr<process_monitor> console_user_server_process_monitor_;
 };
+}

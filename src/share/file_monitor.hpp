@@ -1,11 +1,13 @@
 #pragma once
 
 #include "filesystem.hpp"
+#include "gcd_utility.hpp"
 #include <CoreServices/CoreServices.h>
 #include <spdlog/spdlog.h>
 #include <utility>
 #include <vector>
 
+namespace krbn {
 class file_monitor final {
 public:
   typedef std::function<void(const std::string& file_path)> callback;
@@ -29,11 +31,7 @@ public:
           CFArrayAppendValue(directories_, directory);
           CFRelease(directory);
 
-          for (const auto& file : target.second) {
-            auto f = file;
-            filesystem::normalize_file_path(f);
-            files_.push_back(f);
-          }
+          files_.insert(files_.end(), target.second.begin(), target.second.end());
         }
       }
       register_stream();
@@ -51,6 +49,31 @@ public:
 
 private:
   void register_stream(void) {
+    // ----------------------------------------
+    // File System Events API does not call the callback if the root directory and files are moved at the same time.
+    //
+    // Example:
+    //
+    //   FSEventStreamCreate(... ,{"target/file1", "target/file2"})
+    //
+    //   $ mkdir target.new
+    //   $ echo  target.new/file1
+    //   $ mv    target.new target
+    //
+    //   In this case, the callback will not be called.
+    //
+    // Thus, we should call the callback manually.
+
+    if (callback_) {
+      for (const auto& file : files_) {
+        if (filesystem::exists(file)) {
+          callback_(file);
+        }
+      }
+    }
+
+    // ----------------------------------------
+
     FSEventStreamContext context{0};
     context.info = this;
 
@@ -86,12 +109,15 @@ private:
   }
 
   void unregister_stream(void) {
-    if (stream_) {
-      FSEventStreamStop(stream_);
-      FSEventStreamInvalidate(stream_);
-      FSEventStreamRelease(stream_);
-      stream_ = nullptr;
-    }
+    // Release stream_ in main thread to avoid callback invocations after object has been destroyed.
+    gcd_utility::dispatch_sync_in_main_queue(^{
+      if (stream_) {
+        FSEventStreamStop(stream_);
+        FSEventStreamInvalidate(stream_);
+        FSEventStreamRelease(stream_);
+        stream_ = nullptr;
+      }
+    });
   }
 
   static void static_stream_callback(ConstFSEventStreamRef stream,
@@ -121,13 +147,17 @@ private:
         register_stream();
 
       } else {
-        std::string path = event_paths[i];
-        filesystem::normalize_file_path(path);
+        // FSEvents passes realpathed file path to callback.
+        // Thus, we have to compare realpathed file paths.
 
-        for (const auto& file : files_) {
-          if (file == path) {
-            if (callback_) {
-              callback_(path);
+        if (auto event_path = filesystem::realpath(event_paths[i])) {
+          for (const auto& file : files_) {
+            if (auto path = filesystem::realpath(file)) {
+              if (*event_path == *path) {
+                if (callback_) {
+                  callback_(*event_path);
+                }
+              }
             }
           }
         }
@@ -142,3 +172,4 @@ private:
   std::vector<std::string> files_;
   FSEventStreamRef stream_;
 };
+}

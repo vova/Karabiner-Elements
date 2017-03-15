@@ -2,23 +2,12 @@
 
 * `karabiner_grabber`
   * Run with root privilege.
-  * Seize the input devices and modify events then post events using CGEventPost or `karabiner_event_dispatcher`.
-* `karabiner_event_dispatcher`
-  * Launch with root privilege. And then change uid to console user.
-  * Receive media control events from `karabiner_grabber` and post them to IOHIDSystem.
+  * Seize the input devices and modify events then post events using `Karabiner-VirtualHIDDevice`.
 * `karabiner_console_user_server`
   * Run with console user privilege.
   * Monitor system preferences values (key repeat, etc) and notify them to `karabiner_grabber`.
   * Monitor a karabiner configuration file and notify changes to `karabiner_grabber`.
   * `karabiner_grabber` seizes devices only when `karabiner_console_user_server` is running.
-
-## About security
-
-`karabiner_grabber` and `karabiner_event_dispatcher` treat very sensitive data (input events from device).
-And they seizes devices even in Secure Keyboard Entry.
-
-They are communicating by using unix domain sockets.
-To avoid the data leaks, the unix domain socket of `karabiner_event_dispatcher` is owned by root user and forbid access from normal privilege users.
 
 ## program sequence
 
@@ -27,16 +16,9 @@ To avoid the data leaks, the unix domain socket of `karabiner_event_dispatcher` 
 `karabiner_grabber`
 
 1. Run `karabiner_grabber`.
-2. `karabiner_grabber` launches `karabiner_event_dispatcher`.
 3. `karabiner_grabber` opens grabber server unix domain socket.
 4. `karabiner_grabber` start polling the session state.
 5. When session state is changed, `karabiner_grabber` changes the unix domain socket owner to console user.
-
-`karabiner_event_dispatcher`
-
-1. `karabiner_event_dispatcher` provides a unix domain socket for `karabiner_grabber`.
-2. `karabiner_event_dispatcher` makes a connection to `karabiner_grabber`.
-3. `karabiner_event_dispatcher` changes their uid to the console user.
 
 ### device grabbing
 
@@ -58,7 +40,7 @@ Thus, `karabiner_grabber` cannot send events to IOHIDSystem directly.
 IOKit allows you to read raw HID input events from kernel.<br />
 The highest layer is IOHIDQueue which provides us the HID values.
 
-karabiner_grabber uses this method.
+`karabiner_grabber` uses this method.
 
 ## CGEventTapCreate
 
@@ -67,21 +49,22 @@ It does not work with Secure Keyboard Entry even if we use `kCGHIDEventTap` and 
 Thus, it does not work in Terminal.<br />
 You can confirm this behavior in `appendix/eventtap`.
 
+However, we should modify mouse event's modifier flags manually.
+Thus, `karabiner_grabber` uses this method to modify mouse events.
+
 --------------------------------------------------------------------------------
 
 # The difference of event posting methods
 
-## CGEventPost
+## IOKit call IOHIKeyboard::dispatchKeyboardEvent in kext
 
-It requires posting coregraphics events.<br />
+It requires posting HID usage page and usage.
+`karabiner_grabber` uses this method by using `Karabiner-VirtualHIDDevice`.
 
-`karabiner_grabber` uses this method to post generic key events.
+## IOKit device report in kext
 
-However, there is a limitation that the mouse events will ignore modifier flags by CGEventPost.
-For example, even if we pressed the command key (and the kCGEventFlagMaskCommand is sent by CGEventPost),
-the mouse click event will be treated as click without any modifier flags. (not command+click)
-
-We have to send modifier event via virtual device driver.
+It requires posting HID events.<br />
+The IOHIKeyboard processes the reports by passing reports to `handleReport`.
 
 ## IOHIDPostEvent
 
@@ -90,35 +73,37 @@ It requires posting coregraphics events.<br />
 `IOHIDPostEvent` will be failed if the process is not running in the current session user.
 (The root user is also forbidden.)
 
-`karabiner_event_dispatcher` uses this method.
+## CGEventPost
 
-However, there is a limitation that the mouse events will ignore modifier flags by IOHIDPostEvent.
-For example, even if we pressed the command key (and the NX_COMMANDMASK is sent by IOHIDPostEvent),
-the mouse click event will be treated as click without any modifier flags. (not command+click)
+It requires posting coregraphics events.<br />
 
-We have to send modifier event via virtual device driver.
+`CGEventPost` does not support some key events in OS X 10.12.
 
-## IOKit device report in kext
+* Mission Control key
+* Launchpad key
+* Option-Command-Escape
 
-It requires posting HID events.<br />
-The IOHIKeyboard processes the reports by passing reports to `handleReport`.
-
-However, this method is not enough polite.
-Calling the `handleReport` method directly causes a problem that OS X ignores `EnableSecureEventInput`.
-(The normal privillege EventTap can observe all events even in Secure Keyboard Entry.)
-So we have to reject this approach for security reason.
-
-Due to the limitation of IOHIDPostEvent, we use the virtual device driver for only modifier flags.
+Thus, `karabiner_grabber` does not use `CGEventPost`.
 
 ## IOKit device value in kext
 
 It requires posting HID events.<br />
 We have to make a complete set of virtual devices to post the IOHIDValue.
 
-## IOKit call IOHIKeyboard::dispatchKeyboardEvent in kext
+--------------------------------------------------------------------------------
 
-It requires posting coregraphics events.<br />
-We have to make a complete set of virtual devices to post the IOHIDValue.
+# Modifier flags handling in kernel
+
+The modifier flag events are handled in the following sequence in macOS 10.12.
+
+1. Receive HID reports from device.
+2. Treat reports in the keyboard device driver.
+3. Treat flags in accessibility functions. (eg. sticky keys, zoom)
+4. Treat flags in mouse events.
+5. Treat flags in IOHIDSystem.
+6. Treat flags in Coregraphics.
+
+Thus, `IOHIDPostEvent` will be ignored in accessibility functions and mouse events.
 
 --------------------------------------------------------------------------------
 
@@ -160,7 +145,7 @@ uint8_t keys[6];
 #### Apple HID keyboard report descriptor
 
 ```
-uint8_t unknown;
+uint8_t record_id;
 uint8_t modifiers;
 uint8_t reserved;
 uint8_t keys[6];

@@ -1,13 +1,42 @@
 #pragma once
 
+#include "boost_defs.hpp"
+
+#include <array>
+#include <boost/optional.hpp>
 #include <string>
 #include <sys/stat.h>
 
+namespace krbn {
 class filesystem final {
 public:
   static bool exists(const std::string& path) {
     struct stat s;
     return (stat(path.c_str(), &s) == 0);
+  }
+
+  static bool create_directory_with_intermediate_directories(const std::string& path, mode_t mode) {
+    if (is_directory(path)) {
+      return true;
+    }
+
+    if (!create_directory_with_intermediate_directories(dirname(path), mode)) {
+      return false;
+    }
+
+    if (mkdir(path.c_str(), mode) != 0) {
+      return false;
+    }
+
+    return true;
+  }
+
+  static boost::optional<off_t> file_size(const std::string& path) {
+    struct stat s;
+    if (stat(path.c_str(), &s) != 0) {
+      return boost::none;
+    }
+    return s.st_size;
   }
 
   static bool is_directory(const std::string& path) {
@@ -80,6 +109,14 @@ public:
     }
 
     path.resize(dest);
+  }
+
+  static boost::optional<std::string> realpath(const std::string& path) {
+    std::array<char, PATH_MAX> resolved_path;
+    if (!::realpath(path.c_str(), &(resolved_path[0]))) {
+      return boost::none;
+    }
+    return std::string(&(resolved_path[0]));
   }
 
 private:
@@ -172,3 +209,4 @@ private:
     return pos;
   }
 };
+}

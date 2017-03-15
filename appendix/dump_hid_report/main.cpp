@@ -15,6 +15,7 @@
 #include <iostream>
 #include <mach/mach_time.h>
 
+namespace {
 class logger final {
 public:
   static spdlog::logger& get_logger(void) {
@@ -36,8 +37,10 @@ public:
       return;
     }
 
-    auto device_matching_dictionaries = iokit_utility::create_device_matching_dictionaries({
+    auto device_matching_dictionaries = krbn::iokit_utility::create_device_matching_dictionaries({
         std::make_pair(kHIDPage_GenericDesktop, kHIDUsage_GD_Keyboard),
+        std::make_pair(kHIDPage_GenericDesktop, kHIDUsage_GD_Mouse),
+        std::make_pair(kHIDPage_GenericDesktop, kHIDUsage_GD_Pointer),
     });
     if (device_matching_dictionaries) {
       IOHIDManagerSetDeviceMatchingMultiple(manager_, device_matching_dictionaries);
@@ -69,37 +72,10 @@ private:
       return;
     }
 
-    hids_[device] = std::make_unique<human_interface_device>(logger::get_logger(), device);
+    krbn::iokit_utility::log_matching_device(logger::get_logger(), device);
+
+    hids_[device] = std::make_unique<krbn::human_interface_device>(logger::get_logger(), device);
     auto& dev = hids_[device];
-
-    auto manufacturer = dev->get_manufacturer();
-    auto product = dev->get_product();
-    auto vendor_id = dev->get_vendor_id();
-    auto product_id = dev->get_product_id();
-    auto location_id = dev->get_location_id();
-    auto serial_number = dev->get_serial_number();
-
-    logger::get_logger().info("matching device: "
-                              "manufacturer:{1}, "
-                              "product:{2}, "
-                              "vendor_id:{3:#x}, "
-                              "product_id:{4:#x}, "
-                              "location_id:{5:#x}, "
-                              "serial_number:{6} "
-                              "@ {0}",
-                              __PRETTY_FUNCTION__,
-                              manufacturer ? *manufacturer : "",
-                              product ? *product : "",
-                              vendor_id ? *vendor_id : 0,
-                              product_id ? *product_id : 0,
-                              location_id ? *location_id : 0,
-                              serial_number ? *serial_number : "");
-
-    // Logitech Unifying Receiver sends a lot of null report. We ignore them.
-    if (manufacturer && *manufacturer == "Logitech" &&
-        product && *product == "USB Receiver") {
-      return;
-    }
 
     dev->open();
     dev->register_report_callback(boost::bind(&dump_hid_report::report_callback, this, _1, _2, _3, _4, _5));
@@ -124,44 +100,48 @@ private:
       return;
     }
 
+    krbn::iokit_utility::log_removal_device(logger::get_logger(), device);
+
     auto it = hids_.find(device);
     if (it != hids_.end()) {
       auto& dev = it->second;
       if (dev) {
-        auto vendor_id = dev->get_vendor_id();
-        auto product_id = dev->get_product_id();
-        auto location_id = dev->get_location_id();
-        logger::get_logger().info("removal device: "
-                                  "vendor_id:{1:#x}, "
-                                  "product_id:{2:#x}, "
-                                  "location_id:{3:#x} "
-                                  "@ {0}",
-                                  __PRETTY_FUNCTION__,
-                                  vendor_id ? *vendor_id : 0,
-                                  product_id ? *product_id : 0,
-                                  location_id ? *location_id : 0);
-
         hids_.erase(it);
       }
     }
   }
 
-  void report_callback(human_interface_device& device,
+  void report_callback(krbn::human_interface_device& device,
                        IOHIDReportType type,
                        uint32_t report_id,
                        uint8_t* report,
                        CFIndex report_length) {
+    // Logitech Unifying Receiver sends a lot of null report. We ignore them.
+    if (auto manufacturer = device.get_manufacturer()) {
+      if (auto product = device.get_product()) {
+        if (*manufacturer == "Logitech" && *product == "USB Receiver") {
+          if (report_id == 0) {
+            return;
+          }
+        }
+      }
+    }
+
     logger::get_logger().info("report_length: {0}", report_length);
+    std::cout << "  report_id: " << std::dec << report_id << std::endl;
     for (CFIndex i = 0; i < report_length; ++i) {
-      std::cout << " key[" << i << "]: 0x" << std::hex << static_cast<int>(report[i]) << std::dec << std::endl;
+      std::cout << "  key[" << i << "]: 0x" << std::hex << static_cast<int>(report[i]) << std::dec << std::endl;
     }
   }
 
   IOHIDManagerRef _Nullable manager_;
-  std::unordered_map<IOHIDDeviceRef, std::unique_ptr<human_interface_device>> hids_;
+  std::unordered_map<IOHIDDeviceRef, std::unique_ptr<krbn::human_interface_device>> hids_;
 };
+}
 
 int main(int argc, const char* argv[]) {
+  krbn::thread_utility::register_main_thread();
+
   dump_hid_report d;
   CFRunLoopRun();
   return 0;
